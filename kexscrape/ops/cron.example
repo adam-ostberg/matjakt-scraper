@@ -1,0 +1,7 @@
+# Daily at 02:30 Europe/Stockholm.
+# Set DATABASE_DSN before enabling this cron entry.
+#
+# CRON_TZ=Europe/Stockholm
+# 30 2 * * * cd /Users/adam/repos/kth/kex-scrape/kexscrape && \
+#   /Users/adam/repos/kth/kex-scrape/.venv/bin/python -m kexscrape.run_all_stores \
+#   --stage-root runs --db-dsn "$DATABASE_DSN" >> runs/cron.log 2>&1
