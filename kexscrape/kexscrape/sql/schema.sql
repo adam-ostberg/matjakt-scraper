@@ -21,6 +21,45 @@ CREATE TABLE IF NOT EXISTS crawl_store_status (
     PRIMARY KEY (run_id, store_id)
 );
 
+CREATE TABLE IF NOT EXISTS staging_scraped_prices (
+    staging_id BIGSERIAL PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    source_store_catalog_id TEXT NOT NULL DEFAULT '',
+    store_name TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    zip_code TEXT NOT NULL DEFAULT '',
+    lat DOUBLE PRECISION,
+    lon DOUBLE PRECISION,
+    store_format TEXT NOT NULL DEFAULT '',
+    delivery_methods JSONB NOT NULL DEFAULT '[]'::jsonb,
+    category_id TEXT,
+    category_name TEXT,
+    category_path TEXT,
+    retailer_product_id TEXT NOT NULL,
+    product_id TEXT,
+    product_key TEXT NOT NULL,
+    name TEXT,
+    brand TEXT,
+    pack_size TEXT,
+    country_of_origin TEXT,
+    product_image_url TEXT,
+    product_information TEXT,
+    ingredients TEXT,
+    unit TEXT,
+    product_type TEXT,
+    is_alcohol BOOLEAN,
+    available BOOLEAN,
+    is_new BOOLEAN,
+    price NUMERIC(12, 4),
+    promo_price NUMERIC(12, 4),
+    unit_price NUMERIC(12, 4),
+    promo_unit_price NUMERIC(12, 4),
+    currency TEXT,
+    observed_at TIMESTAMPTZ NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS stores (
     store_id TEXT PRIMARY KEY,
     source_store_catalog_id TEXT,
@@ -117,3 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_current_prices_product_key_price
 
 CREATE INDEX IF NOT EXISTS idx_price_changes_store_product_observed
     ON price_changes(store_id, product_key, observed_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_staging_scraped_prices_run_id
+    ON staging_scraped_prices(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_staging_scraped_prices_run_store_product_observed
+    ON staging_scraped_prices(run_id, store_id, product_key, observed_at DESC, staging_id DESC);

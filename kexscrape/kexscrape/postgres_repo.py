@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
+from .bulk_ingestion import STAGING_COLUMNS, normalized_record_to_staging_row
 from .ingestion import NormalizedRecord
 
 try:
@@ -23,8 +26,10 @@ class PostgresRepository:
     def __init__(self, dsn: str):
         if psycopg is not None:
             self._conn = psycopg.connect(dsn)
+            self._driver = "psycopg"
         elif psycopg2 is not None:
             self._conn = psycopg2.connect(dsn)
+            self._driver = "psycopg2"
         else:  # pragma: no cover
             raise RuntimeError(
                 "Neither psycopg nor psycopg2 is installed. Install one to use PostgreSQL ingestion."
@@ -49,6 +54,45 @@ class PostgresRepository:
                 if statement:
                     cur.execute(statement)
         self._conn.commit()
+
+    def replace_staged_run(
+        self, *, run_id: str, records: Iterable[NormalizedRecord]
+    ) -> int:
+        self.cleanup_staged_run(run_id=run_id)
+
+        batch: list[NormalizedRecord] = []
+        total = 0
+        for record in records:
+            batch.append(record)
+            if len(batch) >= 5000:
+                self._copy_staging_batch(batch)
+                total += len(batch)
+                batch.clear()
+
+        if batch:
+            self._copy_staging_batch(batch)
+            total += len(batch)
+
+        return total
+
+    def merge_staged_run(self, *, run_id: str) -> None:
+        statements = [
+            _merge_stores_sql(),
+            _merge_products_sql(),
+            _merge_store_products_sql(),
+            _insert_price_changes_sql(),
+            _merge_current_prices_sql(),
+        ]
+        with self._conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement, (run_id,))
+
+    def cleanup_staged_run(self, *, run_id: str) -> None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM staging_scraped_prices WHERE run_id = %s",
+                (run_id,),
+            )
 
     def start_crawl_run(
         self,
@@ -84,6 +128,27 @@ class PostgresRepository:
                     _json_dumps(metadata),
                 ),
             )
+
+    def _copy_staging_batch(self, batch: list[NormalizedRecord]) -> None:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        for record in batch:
+            writer.writerow(_serialize_copy_row(normalized_record_to_staging_row(record)))
+        buffer.seek(0)
+
+        columns_sql = ", ".join(STAGING_COLUMNS)
+        sql = (
+            "COPY staging_scraped_prices "
+            f"({columns_sql}) "
+            "FROM STDIN WITH (FORMAT csv, NULL '\\N')"
+        )
+
+        with self._conn.cursor() as cur:
+            if self._driver == "psycopg":
+                with cur.copy(sql) as copy:
+                    copy.write(buffer.getvalue())
+            else:
+                cur.copy_expert(sql, buffer)
 
     def finish_crawl_run(
         self,
@@ -466,3 +531,402 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     return value
+
+
+def _serialize_copy_row(row: tuple[Any, ...]) -> list[Any]:
+    serialized: list[Any] = []
+    for value in row:
+        if value is None:
+            serialized.append("\\N")
+        elif isinstance(value, list):
+            serialized.append(_json_dumps(value))
+        elif isinstance(value, Decimal):
+            serialized.append(str(value))
+        elif isinstance(value, datetime):
+            serialized.append(value.isoformat())
+        else:
+            serialized.append(value)
+    return serialized
+
+
+def _latest_staged_records_cte() -> str:
+    return """
+        WITH latest_staged_records AS (
+            SELECT DISTINCT ON (store_id, product_key)
+                staging_id,
+                run_id,
+                store_id,
+                source_store_catalog_id,
+                store_name,
+                city,
+                zip_code,
+                lat,
+                lon,
+                store_format,
+                delivery_methods,
+                category_id,
+                category_name,
+                category_path,
+                retailer_product_id,
+                product_id,
+                product_key,
+                name,
+                brand,
+                pack_size,
+                country_of_origin,
+                product_image_url,
+                product_information,
+                ingredients,
+                unit,
+                product_type,
+                is_alcohol,
+                available,
+                is_new,
+                price,
+                promo_price,
+                unit_price,
+                promo_unit_price,
+                currency,
+                observed_at
+            FROM staging_scraped_prices
+            WHERE run_id = %s
+            ORDER BY store_id, product_key, observed_at DESC, staging_id DESC
+        )
+    """
+
+
+def _merge_stores_sql() -> str:
+    return (
+        """
+        WITH latest_stores AS (
+            SELECT DISTINCT ON (store_id)
+                store_id,
+                source_store_catalog_id,
+                store_name,
+                city,
+                zip_code,
+                store_format,
+                lat,
+                lon,
+                delivery_methods,
+                observed_at
+            FROM staging_scraped_prices
+            WHERE run_id = %s
+            ORDER BY store_id, observed_at DESC, staging_id DESC
+        )
+        INSERT INTO stores (
+            store_id,
+            source_store_catalog_id,
+            store_name,
+            city,
+            zip_code,
+            street,
+            area,
+            slug,
+            store_format,
+            lat,
+            lon,
+            delivery_methods,
+            first_seen_at,
+            last_seen_at
+        )
+        SELECT
+            store_id,
+            source_store_catalog_id,
+            store_name,
+            city,
+            zip_code,
+            '',
+            '',
+            '',
+            store_format,
+            lat,
+            lon,
+            delivery_methods,
+            observed_at,
+            observed_at
+        FROM latest_stores
+        ON CONFLICT (store_id) DO UPDATE
+        SET
+            source_store_catalog_id = EXCLUDED.source_store_catalog_id,
+            store_name = EXCLUDED.store_name,
+            city = EXCLUDED.city,
+            zip_code = EXCLUDED.zip_code,
+            store_format = EXCLUDED.store_format,
+            lat = EXCLUDED.lat,
+            lon = EXCLUDED.lon,
+            delivery_methods = EXCLUDED.delivery_methods,
+            last_seen_at = EXCLUDED.last_seen_at
+        """
+    )
+
+
+def _merge_products_sql() -> str:
+    return (
+        """
+        WITH latest_products AS (
+            SELECT DISTINCT ON (product_key)
+                product_key,
+                product_id,
+                name,
+                brand,
+                pack_size,
+                country_of_origin,
+                product_image_url,
+                product_information,
+                ingredients,
+                unit,
+                product_type,
+                is_alcohol,
+                observed_at
+            FROM staging_scraped_prices
+            WHERE run_id = %s
+            ORDER BY product_key, observed_at DESC, staging_id DESC
+        )
+        INSERT INTO products (
+            product_key,
+            product_id,
+            name,
+            brand,
+            pack_size,
+            country_of_origin,
+            product_image_url,
+            product_information,
+            ingredients,
+            unit,
+            product_type,
+            is_alcohol,
+            first_seen_at,
+            last_seen_at
+        )
+        SELECT
+            product_key,
+            product_id,
+            name,
+            brand,
+            pack_size,
+            country_of_origin,
+            product_image_url,
+            product_information,
+            ingredients,
+            unit,
+            product_type,
+            is_alcohol,
+            observed_at,
+            observed_at
+        FROM latest_products
+        ON CONFLICT (product_key) DO UPDATE
+        SET
+            product_id = COALESCE(products.product_id, EXCLUDED.product_id),
+            name = COALESCE(EXCLUDED.name, products.name),
+            brand = COALESCE(EXCLUDED.brand, products.brand),
+            pack_size = COALESCE(EXCLUDED.pack_size, products.pack_size),
+            country_of_origin = COALESCE(
+                EXCLUDED.country_of_origin,
+                products.country_of_origin
+            ),
+            product_image_url = COALESCE(
+                EXCLUDED.product_image_url,
+                products.product_image_url
+            ),
+            product_information = COALESCE(
+                EXCLUDED.product_information,
+                products.product_information
+            ),
+            ingredients = COALESCE(EXCLUDED.ingredients, products.ingredients),
+            unit = COALESCE(EXCLUDED.unit, products.unit),
+            product_type = COALESCE(EXCLUDED.product_type, products.product_type),
+            is_alcohol = COALESCE(EXCLUDED.is_alcohol, products.is_alcohol),
+            last_seen_at = EXCLUDED.last_seen_at
+        """
+    )
+
+
+def _merge_store_products_sql() -> str:
+    return (
+        """
+        """
+        + _latest_staged_records_cte()
+        + """
+        INSERT INTO store_products (
+            store_id,
+            product_key,
+            retailer_product_id,
+            category_id,
+            category_name,
+            category_path,
+            available,
+            is_new,
+            first_seen_at,
+            last_seen_at
+        )
+        SELECT
+            store_id,
+            product_key,
+            retailer_product_id,
+            category_id,
+            category_name,
+            category_path,
+            available,
+            is_new,
+            observed_at,
+            observed_at
+        FROM latest_staged_records
+        ON CONFLICT (store_id, product_key) DO UPDATE
+        SET
+            retailer_product_id = EXCLUDED.retailer_product_id,
+            category_id = EXCLUDED.category_id,
+            category_name = EXCLUDED.category_name,
+            category_path = EXCLUDED.category_path,
+            available = EXCLUDED.available,
+            is_new = EXCLUDED.is_new,
+            last_seen_at = EXCLUDED.last_seen_at
+        """
+    )
+
+
+def _insert_price_changes_sql() -> str:
+    return (
+        """
+        """
+        + _latest_staged_records_cte()
+        + """
+        , compared_prices AS (
+            SELECT
+                lsr.run_id,
+                lsr.store_id,
+                lsr.product_key,
+                lsr.observed_at,
+                lsr.price,
+                lsr.promo_price,
+                lsr.unit_price,
+                lsr.promo_unit_price,
+                lsr.currency,
+                lsr.available,
+                ARRAY_REMOVE(
+                    ARRAY[
+                        CASE WHEN cp.price IS DISTINCT FROM lsr.price THEN 'price' END,
+                        CASE
+                            WHEN cp.promo_price IS DISTINCT FROM lsr.promo_price
+                            THEN 'promo_price'
+                        END,
+                        CASE
+                            WHEN cp.unit_price IS DISTINCT FROM lsr.unit_price
+                            THEN 'unit_price'
+                        END,
+                        CASE
+                            WHEN cp.promo_unit_price IS DISTINCT FROM lsr.promo_unit_price
+                            THEN 'promo_unit_price'
+                        END,
+                        CASE
+                            WHEN cp.currency IS DISTINCT FROM lsr.currency
+                            THEN 'currency'
+                        END,
+                        CASE
+                            WHEN cp.available IS DISTINCT FROM lsr.available
+                            THEN 'available'
+                        END
+                    ],
+                    NULL
+                ) AS change_fields,
+                jsonb_build_object(
+                    'price', cp.price,
+                    'promo_price', cp.promo_price,
+                    'unit_price', cp.unit_price,
+                    'promo_unit_price', cp.promo_unit_price,
+                    'currency', cp.currency,
+                    'available', cp.available,
+                    'observed_at', cp.observed_at
+                ) AS previous_snapshot,
+                jsonb_build_object(
+                    'price', lsr.price,
+                    'promo_price', lsr.promo_price,
+                    'unit_price', lsr.unit_price,
+                    'promo_unit_price', lsr.promo_unit_price,
+                    'currency', lsr.currency,
+                    'available', lsr.available,
+                    'observed_at', lsr.observed_at
+                ) AS current_snapshot
+            FROM latest_staged_records lsr
+            JOIN current_prices cp
+              ON cp.store_id = lsr.store_id
+             AND cp.product_key = lsr.product_key
+        )
+        INSERT INTO price_changes (
+            run_id,
+            store_id,
+            product_key,
+            observed_at,
+            price,
+            promo_price,
+            unit_price,
+            promo_unit_price,
+            currency,
+            available,
+            change_fields,
+            previous_snapshot,
+            current_snapshot
+        )
+        SELECT
+            run_id,
+            store_id,
+            product_key,
+            observed_at,
+            price,
+            promo_price,
+            unit_price,
+            promo_unit_price,
+            currency,
+            available,
+            change_fields,
+            previous_snapshot,
+            current_snapshot
+        FROM compared_prices
+        WHERE COALESCE(array_length(change_fields, 1), 0) > 0
+        ON CONFLICT (run_id, store_id, product_key) DO NOTHING
+        """
+    )
+
+
+def _merge_current_prices_sql() -> str:
+    return (
+        """
+        """
+        + _latest_staged_records_cte()
+        + """
+        INSERT INTO current_prices (
+            store_id,
+            product_key,
+            run_id,
+            observed_at,
+            price,
+            promo_price,
+            unit_price,
+            promo_unit_price,
+            currency,
+            available
+        )
+        SELECT
+            store_id,
+            product_key,
+            run_id,
+            observed_at,
+            price,
+            promo_price,
+            unit_price,
+            promo_unit_price,
+            currency,
+            available
+        FROM latest_staged_records
+        ON CONFLICT (store_id, product_key) DO UPDATE
+        SET
+            run_id = EXCLUDED.run_id,
+            observed_at = EXCLUDED.observed_at,
+            price = EXCLUDED.price,
+            promo_price = EXCLUDED.promo_price,
+            unit_price = EXCLUDED.unit_price,
+            promo_unit_price = EXCLUDED.promo_unit_price,
+            currency = EXCLUDED.currency,
+            available = EXCLUDED.available
+        """
+    )

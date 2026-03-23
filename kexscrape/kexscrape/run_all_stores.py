@@ -11,14 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .ingestion import IngestionService, read_ndjson_records
+from .bulk_ingestion import BulkIngestionService
 from .postgres_repo import PostgresRepository
 from .store_catalog import StoreCatalogEntry, fetch_store_catalog
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run ICA product scrape for all online stores, stage NDJSON, and ingest into PostgreSQL."
+        description="Run ICA product scrape for all online stores, stage NDJSON, and ingest into PostgreSQL or Supabase."
     )
     parser.add_argument("--run-id", default="", help="Optional explicit run id")
     parser.add_argument(
@@ -45,7 +45,11 @@ def parse_args() -> argparse.Namespace:
         default="scrapy",
         help="Scrapy executable (default: scrapy)",
     )
-    parser.add_argument("--db-dsn", default="", help="PostgreSQL DSN (optional)")
+    parser.add_argument(
+        "--db-dsn",
+        default="",
+        help="PostgreSQL or Supabase DSN (optional)",
+    )
 
     parser.add_argument("--category-depth", default="8")
     parser.add_argument("--max-pages-per-category", default="100")
@@ -97,9 +101,11 @@ def main() -> int:
         ingestion_summary = {"enabled": bool(db_repo), "records_ingested": 0, "error": ""}
         if db_repo is not None:
             staged_files = _successful_store_files(manifest)
-            ingestion_service = IngestionService(db_repo)
-            records = read_ndjson_records(staged_files)
-            ingested = ingestion_service.ingest_records(records, run_id=manifest["run_id"])
+            ingestion_service = BulkIngestionService(db_repo)
+            ingested = ingestion_service.ingest_paths(
+                staged_files,
+                run_id=manifest["run_id"],
+            )
             ingestion_summary["records_ingested"] = ingested
             db_repo.commit()
 

@@ -7,7 +7,7 @@ cd /Users/adam/repos/kth/kex-scrape/kexscrape
 python -m kexscrape.run_all_stores --stage-root runs
 ```
 
-## Run All Stores + PostgreSQL Ingestion
+## Run All Stores + PostgreSQL or Supabase Ingestion
 
 ```bash
 cd /Users/adam/repos/kth/kex-scrape/kexscrape
@@ -48,6 +48,8 @@ python -m kexscrape.ingest_staged_run \
   --run-dir runs/<run_id> \
   --db-dsn "postgresql://user:pass@localhost:5432/ica_prices"
 ```
+
+`--db-dsn` can point to a local PostgreSQL database or a Supabase Postgres/Supavisor session-mode connection string.
 
 ## Example Price Comparison Query
 
