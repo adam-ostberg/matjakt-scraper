@@ -1,10 +1,49 @@
 # ICA All-Store Scrape
 
+## Windows Quick Start
+
+PowerShell:
+
+```powershell
+cd C:\path\to\kex-scrape\kexscrape
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -U pip
+.venv\Scripts\python -m pip install scrapy scrapy-playwright "psycopg[binary]"
+.venv\Scripts\python -m playwright install chromium
+```
+
+Set your DSN once per shell:
+
+```powershell
+$env:DATABASE_DSN = "postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres"
+```
+
+Small test run:
+
+```powershell
+.\ops\run_test.ps1
+```
+
+Full run:
+
+```powershell
+.\ops\run_full.ps1
+```
+
+Both scripts also work without `DATABASE_DSN`; then they only stage NDJSON under `runs\`.
+
 ## Run All Stores (staging only)
 
 ```bash
 cd /Users/adam/repos/kth/kex-scrape/kexscrape
 python -m kexscrape.run_all_stores --stage-root runs
+```
+
+You can also limit products per store during test runs:
+
+```bash
+cd /Users/adam/repos/kth/kex-scrape/kexscrape
+python -m kexscrape.run_all_stores --stage-root runs --max-stores 1 --max-products 20
 ```
 
 ## Run All Stores + PostgreSQL or Supabase Ingestion

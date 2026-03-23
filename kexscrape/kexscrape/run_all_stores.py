@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-stores", type=int, default=0, help="Limit number of stores")
     parser.add_argument(
+        "--max-products",
+        type=int,
+        default=0,
+        help="Limit number of products scraped per store (0 = no limit)",
+    )
+    parser.add_argument(
         "--scrapy-cmd",
         default="scrapy",
         help="Scrapy executable (default: scrapy)",
@@ -346,6 +352,8 @@ def _run_single_store_scrape(
         f"category_depth={args.category_depth}",
         "-a",
         f"max_pages_per_category={args.max_pages_per_category}",
+        "-a",
+        f"max_products={args.max_products}",
         "-a",
         f"include_non_leaf={args.include_non_leaf}",
         "-O",

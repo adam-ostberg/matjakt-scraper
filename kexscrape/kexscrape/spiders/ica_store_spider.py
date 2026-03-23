@@ -83,6 +83,7 @@ class IcaStoreSpider(scrapy.Spider):
         source_store_catalog_id="",
         category_depth="8",
         max_pages_per_category="100",
+        max_products=None,
         max_categories=None,
         include_non_leaf="true",
         *args,
@@ -101,6 +102,7 @@ class IcaStoreSpider(scrapy.Spider):
         self.source_store_catalog_id = str(source_store_catalog_id).strip()
         self.category_depth = int(category_depth)
         self.max_pages_per_category = int(max_pages_per_category)
+        self.max_products = int(max_products) if max_products else None
         self.max_categories = int(max_categories) if max_categories else None
         self.include_non_leaf = str(include_non_leaf).lower() in {
             "1",
@@ -186,12 +188,24 @@ class IcaStoreSpider(scrapy.Spider):
                             retailer_product_id=retailer_product_id,
                         )
                         yield self._to_item(category, product, detail_payload)
+                        if self.max_products and scraped_count >= self.max_products:
+                            self.logger.info(
+                                "Reached max_products=%d for store %s",
+                                self.max_products,
+                                self.store_id,
+                            )
+                            break
 
                     page_token = (
                         category_payload.get("metadata") or {}
                     ).get("nextPageToken")
+                    if self.max_products and scraped_count >= self.max_products:
+                        break
                     if not page_token:
                         break
+
+                if self.max_products and scraped_count >= self.max_products:
+                    break
 
             self.logger.info(
                 "Finished. Unique products scraped: %d", scraped_count
