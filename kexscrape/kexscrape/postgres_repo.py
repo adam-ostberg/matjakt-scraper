@@ -35,6 +35,8 @@ class PostgresRepository:
                 "Neither psycopg nor psycopg2 is installed. Install one to use PostgreSQL ingestion."
             )
         self._conn.autocommit = False
+        with self._conn.cursor() as cur:
+            cur.execute("SET statement_timeout = '60min'")
 
     def close(self) -> None:
         self._conn.close()
