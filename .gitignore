@@ -41,3 +41,5 @@ htmlcov/
 
 # Scrape output artifacts
 kexscrape/runs/
+
+connection_string.txt
