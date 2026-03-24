@@ -11,19 +11,49 @@ param(
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
-$venvScripts = Join-Path $repoRoot ".venv\Scripts"
+$workspaceRoot = Split-Path -Parent $repoRoot
+$venvPythonCandidates = @(
+    (Join-Path $repoRoot ".venv\Scripts\python.exe"),
+    (Join-Path $workspaceRoot ".venv\Scripts\python.exe")
+)
+$venvScriptsCandidates = @(
+    (Join-Path $repoRoot ".venv\Scripts"),
+    (Join-Path $workspaceRoot ".venv\Scripts")
+)
+$pythonArgs = @()
 
 if ([string]::IsNullOrWhiteSpace($PythonExe)) {
-    $PythonExe = $venvPython
+    foreach ($candidate in $venvPythonCandidates) {
+        if (Test-Path $candidate) {
+            $PythonExe = $candidate
+            break
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+        $pyLauncher = Get-Command py -ErrorAction SilentlyContinue
+        if ($null -ne $pyLauncher) {
+            $PythonExe = $pyLauncher.Source
+            $pythonArgs = @("-3")
+        }
+        else {
+            $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+            if ($null -ne $pythonCmd) {
+                $PythonExe = $pythonCmd.Source
+            }
+        }
+    }
 }
 
-if (-not (Test-Path $PythonExe)) {
-    throw "Python executable not found: $PythonExe"
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    throw "Python executable not found. Create .venv first or install Python and make 'py' or 'python' available in PATH."
 }
 
-if (Test-Path $venvScripts) {
-    $env:Path = "$venvScripts;$env:Path"
+foreach ($venvScripts in $venvScriptsCandidates) {
+    if (Test-Path $venvScripts) {
+        $env:Path = "$venvScripts;$env:Path"
+        break
+    }
 }
 
 $arguments = @(
@@ -46,7 +76,7 @@ else {
 
 Push-Location $repoRoot
 try {
-    & $PythonExe @arguments
+    & $PythonExe @pythonArgs @arguments
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
