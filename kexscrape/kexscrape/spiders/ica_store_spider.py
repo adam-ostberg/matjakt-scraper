@@ -85,7 +85,8 @@ class IcaStoreSpider(scrapy.Spider):
         max_pages_per_category="100",
         max_products=None,
         max_categories=None,
-        include_non_leaf="true",
+        include_non_leaf="false",
+        api_timeout_ms="30000",
         *args,
         **kwargs,
     ):
@@ -104,6 +105,7 @@ class IcaStoreSpider(scrapy.Spider):
         self.max_pages_per_category = int(max_pages_per_category)
         self.max_products = int(max_products) if max_products else None
         self.max_categories = int(max_categories) if max_categories else None
+        self.api_timeout_ms = max(1000, int(api_timeout_ms))
         self.include_non_leaf = str(include_non_leaf).lower() in {
             "1",
             "true",
@@ -239,20 +241,25 @@ class IcaStoreSpider(scrapy.Spider):
         for attempt in range(1, retries + 1):
             result = await page.evaluate(
                 """
-                async ({ path }) => {
+                async ({ path, timeoutMs }) => {
+                    const controller = new AbortController();
+                    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
                     try {
                         const response = await fetch(path, {
                             method: "GET",
                             credentials: "include",
                             headers: { "accept": "application/json, text/plain, */*" },
+                            signal: controller.signal,
                         });
                         return { status: response.status, text: await response.text() };
                     } catch (error) {
                         return { status: 0, text: String(error) };
+                    } finally {
+                        clearTimeout(timeoutHandle);
                     }
                 }
                 """,
-                {"path": path},
+                {"path": path, "timeoutMs": self.api_timeout_ms},
             )
 
             status = result.get("status")
@@ -283,18 +290,25 @@ class IcaStoreSpider(scrapy.Spider):
         return None
 
     def _build_categories_to_visit(self, categories):
-        selected = []
+        selected_by_id = {}
 
         def walk(node):
             if not isinstance(node, dict):
                 return
 
+            category_id = str(node.get("categoryId") or "").strip()
             children = node.get("childCategories") or []
             product_count = int(node.get("productCount") or 0)
             is_leaf = len(children) == 0
 
-            if product_count > 0 and (self.include_non_leaf or is_leaf):
-                selected.append(node)
+            if (
+                category_id
+                and product_count > 0
+                and (self.include_non_leaf or is_leaf)
+            ):
+                existing = selected_by_id.get(category_id)
+                if existing is None or product_count > int(existing.get("productCount") or 0):
+                    selected_by_id[category_id] = node
 
             for child in children:
                 walk(child)
@@ -302,6 +316,7 @@ class IcaStoreSpider(scrapy.Spider):
         for root in categories:
             walk(root)
 
+        selected = list(selected_by_id.values())
         # Prefer categories with larger product counts first.
         selected.sort(key=lambda c: int(c.get("productCount") or 0), reverse=True)
         return selected

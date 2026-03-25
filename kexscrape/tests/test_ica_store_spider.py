@@ -55,6 +55,64 @@ class IcaStoreSpiderTests(unittest.TestCase):
         )
         self.assertEqual("Ingredienser text", item["ingredients"])
 
+    def test_build_categories_to_visit_deduplicates_ids_and_skips_non_leaf_by_default(self) -> None:
+        spider = IcaStoreSpider(store_id="1003380")
+
+        categories = [
+            {
+                "categoryId": "parent",
+                "name": "Parent",
+                "productCount": 999,
+                "childCategories": [
+                    {
+                        "categoryId": "leaf-a",
+                        "name": "Leaf A",
+                        "productCount": 12,
+                        "childCategories": [],
+                    },
+                    {
+                        "categoryId": "leaf-a",
+                        "name": "Leaf A duplicate",
+                        "productCount": 8,
+                        "childCategories": [],
+                    },
+                ],
+            },
+            {
+                "categoryId": "leaf-b",
+                "name": "Leaf B",
+                "productCount": 20,
+                "childCategories": [],
+            },
+        ]
+
+        selected = spider._build_categories_to_visit(categories)
+
+        self.assertEqual(["leaf-b", "leaf-a"], [item["categoryId"] for item in selected])
+
+    def test_build_categories_to_visit_can_include_non_leaf_categories(self) -> None:
+        spider = IcaStoreSpider(store_id="1003380", include_non_leaf="true")
+
+        categories = [
+            {
+                "categoryId": "parent",
+                "name": "Parent",
+                "productCount": 25,
+                "childCategories": [
+                    {
+                        "categoryId": "leaf-a",
+                        "name": "Leaf A",
+                        "productCount": 12,
+                        "childCategories": [],
+                    }
+                ],
+            }
+        ]
+
+        selected = spider._build_categories_to_visit(categories)
+
+        self.assertEqual(["parent", "leaf-a"], [item["categoryId"] for item in selected])
+
 
 if __name__ == "__main__":
     unittest.main()

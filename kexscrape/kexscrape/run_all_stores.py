@@ -60,7 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category-depth", default="8")
     parser.add_argument("--max-pages-per-category", default="100")
     parser.add_argument("--max-categories", default="")
-    parser.add_argument("--include-non-leaf", default="true")
+    parser.add_argument("--include-non-leaf", default="false")
+    parser.add_argument(
+        "--api-timeout-ms",
+        type=int,
+        default=30000,
+        help="Per ICA API request timeout inside Playwright page context (default: 30000)",
+    )
     return parser.parse_args()
 
 
@@ -356,6 +362,8 @@ def _run_single_store_scrape(
         f"max_products={args.max_products}",
         "-a",
         f"include_non_leaf={args.include_non_leaf}",
+        "-a",
+        f"api_timeout_ms={args.api_timeout_ms}",
         "-O",
         f"{output_path}:jsonlines",
     ]
