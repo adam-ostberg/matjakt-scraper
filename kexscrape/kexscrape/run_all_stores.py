@@ -6,7 +6,8 @@ import os
 import subprocess
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,9 @@ from typing import Any
 from .bulk_ingestion import BulkIngestionService
 from .postgres_repo import PostgresRepository
 from .store_catalog import StoreCatalogEntry, fetch_store_catalog
+
+# Kill a store's Scrapy process if it hasn't finished within this many seconds.
+_STORE_SCRAPE_TIMEOUT = 6 * 3600  # 6 hours
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,7 +159,7 @@ def main() -> int:
         )
 
         return 0 if final_status in {"SUCCESS", "PARTIAL_SUCCESS"} else 1
-    except Exception as error:
+    except BaseException as error:
         manifest["status"] = "FAILED"
         manifest["error"] = str(error)
         manifest["finished_at_utc"] = _utc_now_iso()
@@ -250,41 +254,47 @@ def _execute_store_scrapes(
 ) -> None:
     max_attempts = max(1, args.max_retries + 1)
     project_dir = Path(__file__).resolve().parents[1]
+    concurrency = max(1, args.concurrency)
 
     while True:
-        pending_store_ids = [
+        # Collect only stores that still need to run this pass.
+        pending_ids: deque[str] = deque(
             store_id
             for store_id, store in manifest["stores"].items()
             if store["status"] in {"PENDING", "RUNNING"}
             and int(store["attempts"]) < max_attempts
-        ]
-        if not pending_store_ids:
+        )
+        if not pending_ids:
             break
 
-        with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as executor:
-            futures = {}
-            for store_id in pending_store_ids:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            active: dict = {}  # Future -> store_id
+
+            def _launch(store_id: str) -> None:
+                """Mark one store as RUNNING and submit its Scrapy subprocess."""
                 store = manifest["stores"][store_id]
                 store["status"] = "RUNNING"
                 store["attempts"] = int(store["attempts"]) + 1
                 store["last_error"] = ""
                 store["last_attempt_started_at_utc"] = _utc_now_iso()
-
                 output_path = Path(store["output_path"])
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 if output_path.exists():
                     output_path.unlink()
+                future = executor.submit(
+                    _run_single_store_scrape,
+                    args=args,
+                    project_dir=project_dir,
+                    run_id=manifest["run_id"],
+                    store=store,
+                    logs_dir=logs_dir,
+                )
+                active[future] = store_id
 
-                futures[
-                    executor.submit(
-                        _run_single_store_scrape,
-                        args=args,
-                        project_dir=project_dir,
-                        run_id=manifest["run_id"],
-                        store=store,
-                        logs_dir=logs_dir,
-                    )
-                ] = store_id
+            # Fill the initial batch — only up to `concurrency` stores are
+            # ever marked RUNNING at the same time, so progress is accurate.
+            for _ in range(min(concurrency, len(pending_ids))):
+                _launch(pending_ids.popleft())
 
             manifest["updated_at_utc"] = _utc_now_iso()
             _save_manifest(manifest_path, manifest)
@@ -292,26 +302,32 @@ def _execute_store_scrapes(
                 _sync_store_statuses(db_repo, manifest)
                 db_repo.commit()
 
-            for future in as_completed(futures):
-                store_id = futures[future]
-                result = future.result()
-                store = manifest["stores"][store_id]
-                store["last_attempt_finished_at_utc"] = _utc_now_iso()
+            while active:
+                done, _ = wait(list(active), return_when=FIRST_COMPLETED)
+                for future in done:
+                    store_id = active.pop(future)
+                    result = future.result()
+                    store = manifest["stores"][store_id]
+                    store["last_attempt_finished_at_utc"] = _utc_now_iso()
 
-                if result["ok"]:
-                    store["status"] = "SUCCESS"
-                else:
-                    store["last_error"] = result["error"]
-                    if int(store["attempts"]) < max_attempts:
-                        store["status"] = "PENDING"
+                    if result["ok"]:
+                        store["status"] = "SUCCESS"
                     else:
-                        store["status"] = "FAILED"
+                        store["last_error"] = result["error"]
+                        if int(store["attempts"]) < max_attempts:
+                            store["status"] = "PENDING"
+                        else:
+                            store["status"] = "FAILED"
 
-                manifest["updated_at_utc"] = _utc_now_iso()
-                _save_manifest(manifest_path, manifest)
-                if db_repo is not None:
-                    _sync_store_statuses(db_repo, manifest)
-                    db_repo.commit()
+                    # Keep the pool full as slots open up.
+                    if pending_ids:
+                        _launch(pending_ids.popleft())
+
+                    manifest["updated_at_utc"] = _utc_now_iso()
+                    _save_manifest(manifest_path, manifest)
+                    if db_repo is not None:
+                        _sync_store_statuses(db_repo, manifest)
+                        db_repo.commit()
 
 
 def _run_single_store_scrape(
@@ -374,28 +390,35 @@ def _run_single_store_scrape(
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
 
-    completed = subprocess.run(
-        command,
-        cwd=str(project_dir),
-        capture_output=True,
-        text=True,
-        env=environment,
-    )
-
-    combined_log = (
-        "COMMAND: "
-        + " ".join(command)
-        + "\n\nSTDOUT:\n"
-        + (completed.stdout or "")
-        + "\n\nSTDERR:\n"
-        + (completed.stderr or "")
-    )
-    log_path.write_text(combined_log, encoding="utf-8")
+    # Stream output directly to the log file so we don't buffer potentially
+    # hundreds of MB of Scrapy logs in RAM for the full duration of the scrape.
+    with log_path.open("w", encoding="utf-8") as log_fh:
+        log_fh.write("COMMAND: " + " ".join(command) + "\n\n")
+        log_fh.flush()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(project_dir),
+                stdout=log_fh,
+                stderr=log_fh,
+                env=environment,
+                timeout=_STORE_SCRAPE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            log_fh.write(f"\n\n[TIMEOUT: process killed after {_STORE_SCRAPE_TIMEOUT}s]\n")
+            return {
+                "ok": False,
+                "error": f"timeout after {_STORE_SCRAPE_TIMEOUT}s",
+                "log_path": str(log_path),
+            }
 
     if completed.returncode == 0 and output_path.exists():
         return {"ok": True, "error": "", "log_path": str(log_path)}
 
-    tail = (completed.stderr or completed.stdout or "").strip().splitlines()[-8:]
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-8:]
+    except OSError:
+        tail = []
     error = (
         f"scrapy exit={completed.returncode}; "
         + " | ".join(line.strip() for line in tail if line.strip())
