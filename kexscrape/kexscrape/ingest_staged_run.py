@@ -5,8 +5,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .bulk_ingestion import BulkIngestionService
+from .ingestion import normalize_record, read_ndjson_records
 from .postgres_repo import PostgresRepository
+
+BATCH_SIZE = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,8 +44,34 @@ def main() -> int:
                 "stage_root": str(run_dir.parent),
             },
         )
-        ingestion = BulkIngestionService(repository)
-        ingested = ingestion.ingest_paths(store_files, run_id=args.run_id)
+        repository.commit()
+
+        total_ingested = 0
+        total_batches = (len(store_files) + BATCH_SIZE - 1) // BATCH_SIZE
+        for i in range(0, len(store_files), BATCH_SIZE):
+            batch_files = store_files[i : i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
+            print(
+                f"[{batch_num}/{total_batches}] Staging {len(batch_files)} stores...",
+                flush=True,
+            )
+
+            records = read_ndjson_records(batch_files)
+            normalized = (normalize_record(r, run_id=args.run_id) for r in records)
+            ingested = repository.replace_staged_run(run_id=args.run_id, records=normalized)
+            repository.commit()
+
+            print(
+                f"[{batch_num}/{total_batches}] Merging {ingested} records...",
+                flush=True,
+            )
+            repository.merge_staged_run(run_id=args.run_id)
+            repository.cleanup_staged_run(run_id=args.run_id)
+            repository.commit()
+
+            total_ingested += ingested
+            print(f"[{batch_num}/{total_batches}] Done.", flush=True)
+
         repository.finish_crawl_run(
             run_id=args.run_id,
             finished_at=datetime.now(timezone.utc),
@@ -53,13 +81,17 @@ def main() -> int:
         )
         repository.commit()
     except Exception:
-        repository.rollback()
+        try:
+            repository.rollback()
+        except Exception:
+            pass
         raise
     finally:
         repository.close()
 
-    print(f"Ingested {ingested} records for run {args.run_id}")
+    print(f"Ingested {total_ingested} records for run {args.run_id}")
     return 0
+
 
 def _load_manifest(path: Path) -> dict[str, object]:
     if not path.exists():
