@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         default=30000,
         help="Per ICA API request timeout inside Playwright page context (default: 30000)",
     )
+    parser.add_argument(
+        "--bop-concurrency",
+        type=int,
+        default=6,
+        help="Number of concurrent BOP product-detail fetches per store (default: 6)",
+    )
     return parser.parse_args()
 
 
@@ -380,6 +386,8 @@ def _run_single_store_scrape(
         f"include_non_leaf={args.include_non_leaf}",
         "-a",
         f"api_timeout_ms={args.api_timeout_ms}",
+        "-a",
+        f"bop_concurrency={args.bop_concurrency}",
         "-O",
         f"{output_path}:jsonlines",
     ]

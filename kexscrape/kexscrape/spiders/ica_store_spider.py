@@ -87,6 +87,7 @@ class IcaStoreSpider(scrapy.Spider):
         max_categories=None,
         include_non_leaf="false",
         api_timeout_ms="30000",
+        bop_concurrency="6",
         *args,
         **kwargs,
     ):
@@ -106,6 +107,7 @@ class IcaStoreSpider(scrapy.Spider):
         self.max_products = int(max_products) if max_products else None
         self.max_categories = int(max_categories) if max_categories else None
         self.api_timeout_ms = max(1000, int(api_timeout_ms))
+        self.bop_concurrency = max(1, int(bop_concurrency))
         self.include_non_leaf = str(include_non_leaf).lower() in {
             "1",
             "true",
@@ -175,6 +177,7 @@ class IcaStoreSpider(scrapy.Spider):
                     if not category_payload:
                         break
 
+                    new_products = []
                     for product in self._iter_products(category_payload):
                         retailer_product_id = str(
                             product.get("retailerProductId") or ""
@@ -184,19 +187,27 @@ class IcaStoreSpider(scrapy.Spider):
                         if retailer_product_id in seen_retailer_ids:
                             continue
                         seen_retailer_ids.add(retailer_product_id)
-                        scraped_count += 1
-                        detail_payload = await self._fetch_product_details(
-                            page=page,
-                            retailer_product_id=retailer_product_id,
-                        )
-                        yield self._to_item(category, product, detail_payload)
-                        if self.max_products and scraped_count >= self.max_products:
-                            self.logger.info(
-                                "Reached max_products=%d for store %s",
-                                self.max_products,
-                                self.store_id,
-                            )
+                        new_products.append(product)
+                        if self.max_products and (scraped_count + len(new_products)) >= self.max_products:
                             break
+
+                    if new_products:
+                        retailer_ids = [
+                            str(p.get("retailerProductId") or "").strip()
+                            for p in new_products
+                        ]
+                        bop_map = await self._batch_fetch_product_details(page, retailer_ids)
+                        for product in new_products:
+                            rid = str(product.get("retailerProductId") or "").strip()
+                            scraped_count += 1
+                            yield self._to_item(category, product, bop_map.get(rid))
+                            if self.max_products and scraped_count >= self.max_products:
+                                self.logger.info(
+                                    "Reached max_products=%d for store %s",
+                                    self.max_products,
+                                    self.store_id,
+                                )
+                                break
 
                     page_token = (
                         category_payload.get("metadata") or {}
@@ -230,12 +241,92 @@ class IcaStoreSpider(scrapy.Spider):
         path = f"/stores/{self.store_id}/api/webproductpagews/v6/product-pages?{query}"
         return await self._fetch_json(page, path)
 
-    async def _fetch_product_details(self, page, retailer_product_id):
-        path = (
-            f"/stores/{self.store_id}/api/webproductpagews/v5/products/bop"
-            f"?retailerProductId={retailer_product_id}"
-        )
-        return await self._fetch_json(page, path)
+    async def _batch_fetch_product_details(self, page, retailer_product_ids):
+        if not retailer_product_ids:
+            return {}
+
+        _BATCH = 50
+        bop_map = {}
+        failed_count = 0
+
+        for batch_start in range(0, len(retailer_product_ids), _BATCH):
+            batch_ids = retailer_product_ids[batch_start:batch_start + _BATCH]
+            results = await page.evaluate(
+                """
+                async ({ storeId, ids, timeoutMs, concurrency, maxRetries }) => {
+                    async function fetchOne(id) {
+                        const path = `/stores/${storeId}/api/webproductpagews/v5/products/bop?retailerProductId=${id}`;
+                        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                            const controller = new AbortController();
+                            const timer = setTimeout(() => controller.abort(), timeoutMs);
+                            try {
+                                const res = await fetch(path, {
+                                    method: "GET",
+                                    credentials: "include",
+                                    headers: { accept: "application/json, text/plain, */*" },
+                                    signal: controller.signal,
+                                });
+                                clearTimeout(timer);
+                                const text = await res.text();
+                                if (res.status === 200) return { id, ok: true, text };
+                                if ([0, 202, 403].includes(res.status)) {
+                                    await new Promise(r => setTimeout(r, 1000 * attempt));
+                                    continue;
+                                }
+                                await new Promise(r => setTimeout(r, 500 * attempt));
+                            } catch (e) {
+                                clearTimeout(timer);
+                                if (attempt < maxRetries) {
+                                    await new Promise(r => setTimeout(r, 1000 * attempt));
+                                    continue;
+                                }
+                                return { id, ok: false, text: String(e) };
+                            }
+                        }
+                        return { id, ok: false, text: "failed" };
+                    }
+
+                    const results = new Array(ids.length);
+                    let next = 0;
+                    async function worker() {
+                        while (next < ids.length) {
+                            const i = next++;
+                            results[i] = await fetchOne(ids[i]);
+                        }
+                    }
+                    await Promise.all(
+                        Array.from({ length: Math.min(concurrency, ids.length) }, () => worker())
+                    );
+                    return results;
+                }
+                """,
+                {
+                    "storeId": self.store_id,
+                    "ids": batch_ids,
+                    "timeoutMs": self.api_timeout_ms,
+                    "concurrency": self.bop_concurrency,
+                    "maxRetries": 4,
+                },
+            )
+
+            for result in results:
+                rid = result.get("id", "")
+                if result.get("ok"):
+                    try:
+                        bop_map[rid] = json.loads(result.get("text", ""))
+                    except json.JSONDecodeError:
+                        self.logger.warning("BOP JSON decode failed for product %s", rid)
+                else:
+                    failed_count += 1
+
+        if failed_count:
+            self.logger.warning(
+                "BOP detail fetch failed for %d/%d products",
+                failed_count,
+                len(retailer_product_ids),
+            )
+
+        return bop_map
 
     async def _fetch_json(self, page, path, retries=4):
         for attempt in range(1, retries + 1):
